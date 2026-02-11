@@ -17,6 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """PyTorch LLaDA2MoE model."""
+from attr import s
 
 import math
 import time
@@ -1064,8 +1065,12 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
 
         # Initialize weights and apply final processing
         self.post_init()
-        self._predictive_offload_enabled = False
+        self.predictive_offload_enabled = False
         self.collect_stats = False
+        self.moe_layers: tuple[int, LLaDA2MoeSparseMoeBlock] = []
+        for layer_idx, layer in enumerate(self.model.layers):
+            if isinstance(layer.mlp, LLaDA2MoeSparseMoeBlock):
+                self.moe_layers.append((layer_idx, layer.mlp))
 
     def get_input_embeddings(self):
         return self.model.word_embeddings
@@ -1085,11 +1090,6 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self.model
 
-    def _iter_sparse_moe_layers(self):
-        for layer_idx, layer in enumerate(self.model.layers):
-            if isinstance(layer.mlp, LLaDA2MoeSparseMoeBlock):
-                yield layer_idx, layer.mlp
-
     @torch.no_grad()
     def _move_non_expert_modules_to_device(self, device: torch.device | str) -> None:
         self.model.word_embeddings.to(device)
@@ -1108,7 +1108,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
                 layer.mlp.to(device)
 
     def _estimate_expert_parameter_bytes(self) -> int:
-        _, moe_block = next(self._iter_sparse_moe_layers())
+        _, moe_block = self.moe_layers[0]
         return sum(
             parameter.numel() * parameter.element_size()
             for parameter in moe_block.experts[0].parameters()
@@ -1128,8 +1128,6 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
                 "CUDA is not available; predictive expert offloading requires a GPU."
             )
 
-        sparse_layers = list(self._iter_sparse_moe_layers())
-
         self._move_non_expert_modules_to_device("cuda")
 
         free_bytes, total_bytes = torch.cuda.mem_get_info("cuda")
@@ -1145,22 +1143,22 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
         assert 0 <= min_budget <= max_budget
 
         computed_budget = usable_bytes // max(
-            1, expert_param_bytes * max(1, len(sparse_layers))
+            1, expert_param_bytes * max(1, len(self.moe_layers))
         )
         gpu_expert_budget = max(min_budget, min(max_budget, computed_budget))
 
-        for _, moe_block in sparse_layers:
+        for _, moe_block in self.moe_layers:
             moe_block.enable_offload(
                 gpu_expert_budget=gpu_expert_budget,
                 collect_stats=collect_stats,
             )
 
         self.collect_stats = collect_stats
-        self._predictive_offload_enabled = predictive_expert_offload
+        self.predictive_offload_enabled = predictive_expert_offload
         return {
-            "enabled": self._predictive_offload_enabled,
+            "enabled": self.predictive_offload_enabled,
             "gpu_expert_budget_per_layer": gpu_expert_budget,
-            "num_sparse_moe_layers": len(sparse_layers),
+            "num_sparse_moe_layers": len(self.moe_layers),
             "expert_param_bytes": expert_param_bytes,
             "cuda_free_bytes": free_bytes,
             "cuda_total_bytes": total_bytes,
@@ -1170,7 +1168,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
     def _snapshot_offload_layer_stats(self) -> dict[int, dict[str, int]]:
         return {
             layer_idx: {key: int(value) for key, value in moe_block._offload_stats.items()}
-            for layer_idx, moe_block in self._iter_sparse_moe_layers()
+            for layer_idx, moe_block in self.moe_layers
         }
 
     @staticmethod
@@ -1201,8 +1199,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
         block_length: int,
     ) -> dict[int, list[int]]:
         predicted: dict[int, list[int]] = {}
-        sparse_layers = list(self._iter_sparse_moe_layers())
-        for (layer_idx, moe_block), (_, topk_idx) in zip(sparse_layers, router_outputs):
+        for (layer_idx, moe_block), (_, topk_idx) in zip(self.moe_layers, router_outputs):
             budget = moe_block._gpu_expert_budget
             selected: list[int] = []
 
@@ -1220,7 +1217,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
         self, predicted_by_layer: dict[int, list[int]]
     ) -> dict[int, list[int]]:
         applied: dict[int, list[int]] = {}
-        for layer_idx, moe_block in self._iter_sparse_moe_layers():
+        for layer_idx, moe_block in self.moe_layers:
             target = predicted_by_layer.get(layer_idx, [])
             moe_block.set_predicted_gpu_experts(target)
             resident_set = moe_block._resident_gpu_experts
@@ -1544,10 +1541,8 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
             `torch.Tensor`: A string containing the generated token IDs, starting
             after the prompt and stopping at the first `eos_id` or `gen_length`.
         """
-        sparse_layers = list(self._iter_sparse_moe_layers()) if self._predictive_offload_enabled else []
-
-        if self._predictive_offload_enabled:
-            for _, moe_block in sparse_layers:
+        if self.predictive_offload_enabled:
+            for _, moe_block in self.moe_layers:
                 moe_block.reset_stats()
 
         steps = min(steps, gen_length // minimal_topk)
@@ -1597,7 +1592,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
                     self._snapshot_offload_layer_stats() if self.collect_stats else {}
                 )
 
-                if self._predictive_offload_enabled:
+                if self.predictive_offload_enabled:
                     forward_outputs = self.forward(
                         cur_x,
                         attention_mask=cur_attn_mask,

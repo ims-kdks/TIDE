@@ -8,6 +8,7 @@ model: LLaDA2MoeModelLM = LLaDA2MoeModelLM.from_pretrained(
     model_path, trust_remote_code=True, dtype=torch.bfloat16
 ).eval()
 offload_info = model.enable_predictive_expert_offload(
+    predictive_expert_offload=True,
     collect_stats=True,
     max_gpu_experts_per_layer=128
 )
