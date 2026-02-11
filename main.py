@@ -1,13 +1,17 @@
 import torch
-import torch.nn.functional as F
 from model.modeling_llada2_moe import LLaDA2MoeModelLM
 from transformers import AutoTokenizer
 
 model_path = "inclusionAI/LLaDA2.0-mini"
-device = "cuda:0"
-model = LLaDA2MoeModelLM.from_pretrained(
+base_device = "cuda:0"
+model: LLaDA2MoeModelLM = LLaDA2MoeModelLM.from_pretrained(
     model_path, trust_remote_code=True, dtype=torch.bfloat16
-).to(device).eval()
+).eval()
+offload_info = model.enable_predictive_expert_offload(
+    collect_stats=True,
+    max_gpu_experts_per_layer=128
+)
+print(offload_info)
 
 tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 

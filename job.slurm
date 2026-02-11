@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --mem=16g
+#SBATCH --mem=64g
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=4    # <- match to OMP_NUM_THREADS
 #SBATCH --partition=gpuA40x4      # <- or one of: gpuA100x4 gpuA40x4 gpuA100x8 gpuMI100x8
 #SBATCH --account=bffh-delta-gpu    # <- match to a "Project" returned by the "accounts" command
 #SBATCH --job-name=job
-#SBATCH --time=03:00:00      # hh:mm:ss for the job
+#SBATCH --time=00:30:00      # hh:mm:ss for the job
 ### GPU options ###
 #SBATCH --gpus-per-node=1
 
@@ -31,6 +31,5 @@ srun python main.py
 #   --trust-remote-code \
 #   --dllm-algorithm LowConfidence \
 #   --dllm-algorithm-config ./config.yaml \
-#   --host 127.0.0.1 \
 #   --port 30000 \
 #   --log-level info
