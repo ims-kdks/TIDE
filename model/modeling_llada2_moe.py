@@ -1165,31 +1165,11 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
             "reserve_bytes": reserve_bytes,
         }
 
-    def _snapshot_offload_layer_stats(self) -> dict[int, dict[str, int]]:
-        return {
-            layer_idx: {key: int(value) for key, value in moe_block._offload_stats.items()}
-            for layer_idx, moe_block in self.moe_layers
-        }
-
-    @staticmethod
-    def _diff_offload_stats(
-        before: dict[int, dict[str, int]], after: dict[int, dict[str, int]]
-    ) -> dict[int, dict[str, int]]:
-        diff: dict[int, dict[str, int]] = {}
-        for layer_idx, layer_after in after.items():
-            layer_before = before.get(layer_idx, {})
-            diff[layer_idx] = {
-                key: int(layer_after.get(key, 0) - layer_before.get(key, 0))
-                for key in layer_after
-            }
-        return diff
-
-    @staticmethod
-    def _sum_offload_stats(layer_stats: dict[int, dict[str, int]]) -> dict[str, int]:
+    def get_offload_stats(self) -> dict[str, int]:
         total_stats: dict[str, int] = {}
-        for stats in layer_stats.values():
-            for key, value in stats.items():
-                total_stats[key] = total_stats.get(key, 0) + int(value)
+        for layer_idx, moe_block in self.moe_layers:
+            for key, value in moe_block._offload_stats.items():
+                total_stats[key] = total_stats.get(key, 0) + value    
         return total_stats
 
     def predict_experts_from_router(
@@ -1541,10 +1521,6 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
             `torch.Tensor`: A string containing the generated token IDs, starting
             after the prompt and stopping at the first `eos_id` or `gen_length`.
         """
-        if self.predictive_offload_enabled:
-            for _, moe_block in self.moe_layers:
-                moe_block.reset_stats()
-
         steps = min(steps, gen_length // minimal_topk)
         input_ids = inputs.to(self.device)
 
@@ -1588,9 +1564,6 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
                 if not active_tokens:
                     break
                 step_start_time = time.perf_counter()
-                step_stats_before = (
-                    self._snapshot_offload_layer_stats() if self.collect_stats else {}
-                )
 
                 if self.predictive_offload_enabled:
                     forward_outputs = self.forward(
@@ -1637,22 +1610,17 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
                 if transfer_index.any():
                     cur_x[:, -block_length:][transfer_index] = x0[transfer_index]
 
-                transferred_tokens = transfer_index.sum().item()
-                step_elapsed_ms = (time.perf_counter() - step_start_time) * 1000.0
                 if self.collect_stats:
-                    step_stats_after = self._snapshot_offload_layer_stats()
-                    step_stats_delta = self._diff_offload_stats(
-                        step_stats_before, step_stats_after
-                    )
-                    step_total_delta = self._sum_offload_stats(step_stats_delta)
                     print({
                         "block": num_block,
                         "step": step,
-                        "elapsed_ms": step_elapsed_ms,
+                        "elapsed_ms": (time.perf_counter() - step_start_time) * 1000.0,
                         "active_tokens": active_tokens,
-                        "transferred_tokens": transferred_tokens,
-                        "step_total_delta": step_total_delta,
+                        "transferred_tokens": transfer_index.sum().item(),
+                        "offload_stats": self.get_offload_stats(),
                     })
+                    for _, moe_block in self.moe_layers:
+                        moe_block.reset_stats()
 
                 if eos_early_stop and (x0[transfer_index] == eos_id).any():
                     eos_pos_in_x = (cur_x[0] == eos_id).nonzero(as_tuple=True)
