@@ -307,7 +307,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             )
         self._offload_enabled = False
         self._gpu_expert_budget = self.config.num_experts
-        self._resident_gpu_experts = set()
+        self._resident_gpu_experts: set[int] = set()
         self.collect_stats = False
         self.reset_stats()
 
@@ -351,10 +351,17 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
 
     @torch.no_grad()
     def set_predicted_gpu_experts(self, target_order: list[int]) -> None:
+        # # Verify current number of experts on GPU
+        # experts_device_count = [idx for idx in range(self.config.num_experts) if self._get_expert_device(idx).type == "cuda"]
+        # print(f"Current GPU experts: {len(experts_device_count)}")
+        
         target_set = set(target_order)
-        current_set = set(self._resident_gpu_experts)
-        to_promote = [idx for idx in target_order if idx not in current_set]
-        to_demote = [idx for idx in current_set if idx not in target_set]
+        to_promote = [idx for idx in target_order if idx not in self._resident_gpu_experts]
+        can_demote = [idx for idx in self._resident_gpu_experts if idx not in target_set]
+        
+        # Cap the number of demotions to the number of promotions to avoid unnecessary data transfer when the target set is very different from the current set
+        to_demote = can_demote[:len(to_promote)]
+        target_set.update(can_demote[len(to_promote):])
 
         for idx in to_demote:
             self.experts[idx].to("cpu")
@@ -1067,7 +1074,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
         self.post_init()
         self.predictive_offload_enabled = False
         self.collect_stats = False
-        self.moe_layers: tuple[int, LLaDA2MoeSparseMoeBlock] = []
+        self.moe_layers: list[tuple[int, LLaDA2MoeSparseMoeBlock]] = []
         for layer_idx, layer in enumerate(self.model.layers):
             if isinstance(layer.mlp, LLaDA2MoeSparseMoeBlock):
                 self.moe_layers.append((layer_idx, layer.mlp))
