@@ -1192,19 +1192,6 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
             predicted[layer_idx] = selected
         return predicted
 
-    @torch.no_grad()
-    def _apply_predicted_experts(
-        self, predicted_by_layer: dict[int, list[int]]
-    ) -> dict[int, list[int]]:
-        applied: dict[int, list[int]] = {}
-        for layer_idx, moe_block in self.moe_layers:
-            target = predicted_by_layer.get(layer_idx, [])
-            moe_block.set_predicted_gpu_experts(target)
-            resident_set = moe_block._resident_gpu_experts
-            # Keep deterministic order for warm-starting the next block.
-            applied[layer_idx] = [expert_id for expert_id in target if expert_id in resident_set]
-        return applied
-
     @add_start_docstrings_to_model_forward(LLADA2MOE_INPUTS_DOCSTRING)
     @replace_return_docstrings(
         output_type=MoeCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC
@@ -1578,7 +1565,9 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
                         active_block_mask,
                         block_length,
                     )
-                    self._apply_predicted_experts(predicted_experts)
+                    for layer_idx, moe_block in self.moe_layers:
+                        target = predicted_experts.get(layer_idx, [])
+                        moe_block.set_predicted_gpu_experts(target)
                 else:
                     logits = self.forward(
                         cur_x,
