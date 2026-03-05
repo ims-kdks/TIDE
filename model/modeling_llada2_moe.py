@@ -31,7 +31,6 @@ from torch.nn import CrossEntropyLoss
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_attn_mask_utils import (
-    _prepare_4d_causal_attention_mask,
     _prepare_4d_causal_attention_mask_for_sdpa,
 )
 from transformers.modeling_outputs import (
@@ -43,7 +42,6 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.pytorch_utils import (
     ALL_LAYERNORM_LAYERS,
-    is_torch_greater_or_equal_than_1_13,
 )
 from transformers.utils import (
     TransformersKwargs,
@@ -52,18 +50,8 @@ from transformers.utils import (
     logging,
     replace_return_docstrings,
 )
-from transformers.utils.import_utils import is_torch_fx_available
 from .configuration_llada2_moe import LLaDA2MoeConfig
 from transformers.generation.utils import GenerationMixin
-
-
-# This makes `_prepare_4d_causal_attention_mask` a leaf function in the FX graph.
-# It means that the function will not be traced through and simply appear as a node in the graph.
-if is_torch_fx_available():
-    if not is_torch_greater_or_equal_than_1_13:
-        import torch.fx
-
-    _prepare_4d_causal_attention_mask = torch.fx.wrap(_prepare_4d_causal_attention_mask)
 
 
 logger = logging.get_logger(__name__)
@@ -479,10 +467,8 @@ def eager_attention_forward(
 ):
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
-
-    attn_weights = (
-        torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    )
+    
+    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
     if attention_mask is not None:
         attn_weights = attn_weights + attention_mask[:, :, :, : key_states.shape[-2]]
 
@@ -567,7 +553,7 @@ class LLaDA2MoeAttention(nn.Module):
             tuple[torch.Tensor, torch.Tensor]
         ] = None,  # necessary, but kept here for BC
         **kwargs,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
         input_shape = hidden_states.shape[:-1]
 
         bsz, q_len, _ = hidden_states.size()
@@ -954,18 +940,7 @@ class LLaDA2MoeModel(LLaDA2MoePreTrainedModel):
                 device=inputs_embeds.device,
             )
             position_ids = position_ids.unsqueeze(0)
-
-        if self._use_flex_attention:
-            if attention_mask is not None and isinstance(attention_mask, torch.Tensor):
-                attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
-                    attention_mask,
-                    (batch_size, seq_length),
-                    inputs_embeds,
-                    past_seen_tokens,
-                )
-        elif self._use_sdpa and not output_attentions:
-            # output_attentions=True can not be supported when using SDPA, and we fall back on
-            # the manual implementation that requires a 4D causal mask in all cases.
+        if attention_mask.size() == (batch_size, 1, seq_length, seq_length):
             attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
                 attention_mask,
                 (batch_size, seq_length),
@@ -973,12 +948,8 @@ class LLaDA2MoeModel(LLaDA2MoePreTrainedModel):
                 past_seen_tokens,
             )
         else:
-            # 4d mask is passed through the layers
-            attention_mask = _prepare_4d_causal_attention_mask(
-                attention_mask,
-                (batch_size, seq_length),
-                inputs_embeds,
-                past_seen_tokens,
+            raise ValueError(
+                f"LLaDA2.0 only support block attention mask with shape: {(batch_size, 1, seq_length, seq_length)}, the input attention with shape {attention_mask.size()=}!"
             )
 
         # embed positions
@@ -1074,6 +1045,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
         self.post_init()
         self.predictive_offload_enabled = False
         self.collect_stats = False
+        self.jump_steps = 1
         self.moe_layers: list[tuple[int, LLaDA2MoeSparseMoeBlock]] = []
         for layer_idx, layer in enumerate(self.model.layers):
             if isinstance(layer.mlp, LLaDA2MoeSparseMoeBlock):
@@ -1129,6 +1101,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
         reserve_vram_gb: float = 1.5,
         predictive_expert_offload: bool = True,
         collect_stats: bool = False,
+        jump_steps: int = 1,
     ) -> dict[str, Any]:
         if not torch.cuda.is_available():
             raise RuntimeError(
@@ -1162,6 +1135,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
 
         self.collect_stats = collect_stats
         self.predictive_offload_enabled = predictive_expert_offload
+        self.jump_steps = jump_steps
         return {
             "enabled": self.predictive_offload_enabled,
             "gpu_expert_budget_per_layer": gpu_expert_budget,
@@ -1170,6 +1144,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
             "cuda_free_bytes": free_bytes,
             "cuda_total_bytes": total_bytes,
             "reserve_bytes": reserve_bytes,
+            "jump_steps": jump_steps,
         }
 
     def get_offload_stats(self) -> dict[str, int]:
@@ -1447,7 +1422,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
     @torch.no_grad()
     def generate(
         self,
-        inputs: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
         temperature: int = 0.0,
         block_length: int = 32,
         steps: int = 32,
@@ -1459,6 +1434,12 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
         threshold: float = 0.95,
         eos_id: int = 156892,
         mask_id: int = 156895,
+        max_length=None,
+        attention_mask=None,
+        stopping_criteria=None,
+        pad_token_id=None,
+        use_cache=None,
+        do_sample=None,
     ):
         r"""
         Generates tokens using a block-wise, iterative refinement strategy.
@@ -1516,7 +1497,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
             after the prompt and stopping at the first `eos_id` or `gen_length`.
         """
         steps = min(steps, gen_length // minimal_topk)
-        input_ids = inputs.to(self.device)
+        input_ids = input_ids.to(self.device)
 
         prompt_length = input_ids.shape[1]
         num_blocks = (prompt_length + gen_length + block_length - 1) // block_length
@@ -1559,7 +1540,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
                     break
                 step_start_time = time.perf_counter()
 
-                if self.predictive_offload_enabled:
+                if self.predictive_offload_enabled and step % self.jump_steps == 0:
                     forward_outputs = self.forward(
                         cur_x,
                         attention_mask=cur_attn_mask,
