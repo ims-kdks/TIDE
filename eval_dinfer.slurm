@@ -38,7 +38,8 @@ eos_early_stop=True
 predictive_expert_offload=True
 collect_stats=False
 max_gpu_experts_per_layer=128
-jump_steps=1
+jump_steps=10
+limit=10
 task=mbpp_sanitized_llada_moe
 # for llada 1.5 use tasks gsm8k_llada1.5 mbpp_sanitized_llada1.5
 # for llada moe use tasks gsm8k_llada_moe mbpp_sanitized_llada_moe
@@ -47,4 +48,5 @@ output_path=${ouput_dir}/${task}
 python eval_dinfer.py --tasks ${task} \
 --confirm_run_unsafe_code --model dInfer_eval \
 --model_args model_path=${model_path},gen_length=${length},block_length=${block_length},threshold=${threshold},show_speed=True,save_dir=${output_path},save_samples=${save_samples},eos_early_stop=${eos_early_stop},predictive_expert_offload=${predictive_expert_offload},collect_stats=${collect_stats},max_gpu_experts_per_layer=${max_gpu_experts_per_layer},jump_steps=${jump_steps} \
+--limit ${limit} \
 --output_path ${output_path} --include_path ./tasks --apply_chat_template

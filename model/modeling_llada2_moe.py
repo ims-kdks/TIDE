@@ -200,7 +200,7 @@ class LLaDA2MoeMLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x):
+    def forward(self, x, use_jit: Optional[bool] = False):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -371,7 +371,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             "demotions": 0,
         }
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, use_jit: Optional[bool] = False):
         identity = hidden_states
         bsz, seq_len, h = hidden_states.shape
         topk_idx, topk_weight, router_logits = self.gate(hidden_states)
@@ -387,9 +387,14 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
             y = y.to(hidden_states.dtype).view(bsz, seq_len, h)
         else:
-            y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(
-                bsz, seq_len, h
-            )
+            if use_jit:
+                y = self.jit_moe_infer(hidden_states, topk_idx, topk_weight).view(
+                    bsz, seq_len, h
+                )
+            else:
+                y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(
+                    bsz, seq_len, h
+                )
         if self.config.num_shared_experts is not None:
             y = y + self.shared_experts(identity)
         return y, (
@@ -403,6 +408,59 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         cnts.scatter_(1, topk_ids, 1)
         tokens_per_expert = cnts.sum(dim=0).tolist()
         idxs = topk_ids.view(-1).argsort()
+        sorted_tokens = x[idxs // topk_ids.shape[1]]
+        outputs = sorted_tokens.new_empty(sorted_tokens.shape)
+        start_idx = 0
+        for i, num_tokens in enumerate(tokens_per_expert):
+            if num_tokens == 0:
+                continue
+            end_idx = start_idx + num_tokens
+            expert = self.experts[i]
+            tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
+            expert_device = self._get_expert_device(i)
+            if expert_device != tokens_for_this_expert.device:
+                tokens_for_this_expert = tokens_for_this_expert.to(expert_device)
+            expert_out = expert(tokens_for_this_expert)
+            if expert_out.device != x.device:
+                expert_out = expert_out.to(x.device)
+            outputs[start_idx:end_idx] = expert_out
+            if self.collect_stats:
+                if expert_device.type == "cpu":
+                    self._offload_stats["cpu_tokens"] += num_tokens
+                    self._offload_stats["cpu_calls"] += 1
+                else:
+                    self._offload_stats["gpu_tokens"] += num_tokens
+                    self._offload_stats["gpu_calls"] += 1
+            start_idx = end_idx
+
+        new_x = torch.empty_like(outputs)
+        new_x[idxs] = outputs
+        final_out = (
+            new_x.view(*topk_ids.shape, -1)
+            .type(topk_weight.dtype)
+            .mul_(topk_weight.unsqueeze(dim=-1))
+            .sum(dim=1)
+            .type(new_x.dtype)
+        )
+        return final_out
+
+    @torch.no_grad()
+    def jit_moe_infer(self, x, topk_ids, topk_weight):
+        """
+        This path is used only when predictive_offload_enabled is set to False.
+        Based on the input, decide what experts should be moved to (or stay on) the GPU, and what experts should be moved to (or stay on) CPU.
+        Be respectful to the gpu_expert_budget.
+        """
+        num_experts = len(self.experts)
+        flat_topk_ids = topk_ids.view(-1)
+        expert_token_counts = torch.bincount(flat_topk_ids, minlength=num_experts)
+
+        top_counts, top_indices = torch.topk(expert_token_counts, k=self._gpu_expert_budget)
+        target_gpu_experts = top_indices[top_counts > 0].tolist()
+        self.set_predicted_gpu_experts(target_gpu_experts)
+
+        tokens_per_expert = expert_token_counts.tolist()
+        idxs = flat_topk_ids.argsort()
         sorted_tokens = x[idxs // topk_ids.shape[1]]
         outputs = sorted_tokens.new_empty(sorted_tokens.shape)
         start_idx = 0
@@ -649,6 +707,7 @@ class LLaDA2MoeDecoderLayer(nn.Module):
         position_embeddings: Optional[
             tuple[torch.Tensor, torch.Tensor]
         ] = None,  # necessary, but kept here for BC
+        use_jit: Optional[bool] = False,
         **kwargs,
     ) -> tuple[
         torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]
@@ -693,7 +752,7 @@ class LLaDA2MoeDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, use_jit)
         if isinstance(hidden_states, tuple):
             hidden_states, router_logits = hidden_states
         else:
@@ -881,6 +940,7 @@ class LLaDA2MoeModel(LLaDA2MoePreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        use_jit: Optional[bool] = False,
         **kwargs,
     ) -> tuple | MoeModelOutputWithPast:
         output_attentions = (
@@ -990,6 +1050,7 @@ class LLaDA2MoeModel(LLaDA2MoePreTrainedModel):
                     output_router_logits=output_router_logits,
                     use_cache=use_cache,
                     position_embeddings=position_embeddings,
+                    use_jit=use_jit,
                 )
             hidden_states = layer_outputs[0]
 
@@ -1191,6 +1252,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        use_jit: Optional[bool] = False,
         **kwargs,
     ) -> tuple | MoeCausalLMOutputWithPast:
         r"""
@@ -1248,6 +1310,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
             return_dict=return_dict,
+            use_jit=use_jit,
             **kwargs,
         )
 
@@ -1540,28 +1603,12 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
                     break
                 step_start_time = time.perf_counter()
 
-                if self.predictive_offload_enabled and step % self.jump_steps == 0:
-                    forward_outputs = self.forward(
-                        cur_x,
-                        attention_mask=cur_attn_mask,
-                        position_ids=cur_position_ids,
-                        output_router_logits=True,
-                    )
-                    logits = forward_outputs.logits
-                    predicted_experts = self.predict_experts_from_router(
-                        forward_outputs.router_logits,
-                        active_block_mask,
-                        block_length,
-                    )
-                    for layer_idx, moe_block in self.moe_layers:
-                        target = predicted_experts.get(layer_idx, [])
-                        moe_block.set_predicted_gpu_experts(target)
-                else:
-                    logits = self.forward(
-                        cur_x,
-                        attention_mask=cur_attn_mask,
-                        position_ids=cur_position_ids,
-                    ).logits
+                logits = self.forward(
+                    cur_x,
+                    attention_mask=cur_attn_mask,
+                    position_ids=cur_position_ids,
+                    use_jit=(self.predictive_offload_enabled and step % self.jump_steps == 0),
+                ).logits
 
                 active_logits = logits[:, -block_length:, :]
                 x0, x0_p = self._sample_with_temperature_topk_topp(

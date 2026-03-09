@@ -10,7 +10,8 @@ model: LLaDA2MoeModelLM = LLaDA2MoeModelLM.from_pretrained(
 offload_info = model.enable_predictive_expert_offload(
     predictive_expert_offload=True,
     collect_stats=True,
-    max_gpu_experts_per_layer=128
+    max_gpu_experts_per_layer=128,
+    jump_steps=8,
 )
 print(offload_info)
 
@@ -25,7 +26,7 @@ input_ids = tokenizer.apply_chat_template(
 )
 # input_ids = tokenizer.encode([prompt])
 generated_tokens = model.generate(
-    inputs=input_ids,
+    input_ids=input_ids,
     eos_early_stop=True,
     gen_length=1024,
     block_length=32,

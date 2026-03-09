@@ -1,4 +1,5 @@
 '''
+Code adapted from https://github.com/inclusionAI/dInfer
 This file is inspired by the code from https://github.com/NVlabs/Fast-dLLM
 '''
 import torch
