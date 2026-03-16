@@ -105,6 +105,7 @@ class DInferEvalHarness(LM):
         self.eos_early_stop = eos_early_stop
 
         self.mask_id = 156895
+        self.eos_id = 156892
         
         self.device= torch.device(device)
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -317,13 +318,13 @@ class DInferEvalHarness(LM):
         tpss = []
         total_token = 0
         token_numbers = []
-    
+        total_stats = []
         for i, req in enumerate(tqdm(requests, desc="Generating...")):
             input_ids = all_input_ids[i]
             padded_gen_len = padded_gen_lens[i]
             inner_start = time.time()
             input_ids = input_ids.to(self.device)
-            out = self.model.generate(
+            out, stats = self.model.generate(
                 input_ids,
                 gen_length=padded_gen_len,
                 block_length=self.block_length,
@@ -332,14 +333,49 @@ class DInferEvalHarness(LM):
             inner_stop = time.time()
             sample_time = inner_stop - inner_start
             outputs.append(out)
-            answer = (self.tokenizer.decode(out[0, all_input_ids[i].shape[1]:], skip_special_tokens=True))
+            answer = (self.tokenizer.decode(out[0], skip_special_tokens=True))
             answers.append(answer)
-            token_number = out.shape[1] - input_ids.shape[1]
+            token_number = (out != self.eos_id).sum().item()
             token_numbers.append(token_number)
             tps = token_number/sample_time
             tpss.append(tps)
             total_token += token_number
-        total_token = total_token
+
+            # stats
+            total_stats.append({
+                "demotions": [step["offload_stats"]["demotions"] for step in stats],
+                "promotions": [step["offload_stats"]["promotions"] for step in stats],
+                "cpu_tokens": [step["offload_stats"]["cpu_tokens"] for step in stats],
+                "gpu_tokens": [step["offload_stats"]["gpu_tokens"] for step in stats],
+                "cpu_calls": [step["offload_stats"]["cpu_calls"] for step in stats],
+                "gpu_calls": [step["offload_stats"]["gpu_calls"] for step in stats],
+                "gpu_compute_time": [step["offload_stats"]["gpu_compute_time"] for step in stats],
+                "cpu_compute_time": [step["offload_stats"]["cpu_compute_time"] for step in stats],
+                "gpu_tokens_move_time": [step["offload_stats"]["gpu_tokens_move_time"] for step in stats],
+                "cpu_tokens_move_time": [step["offload_stats"]["cpu_tokens_move_time"] for step in stats],
+                "experts_move_time": [step["offload_stats"]["experts_move_time"] for step in stats],
+                "transferred_tokens": [step["transferred_tokens"] for step in stats],
+                "elapsed_ms": [step["elapsed_ms"] for step in stats],
+            })
+
+        if total_stats:
+            stats_count = len(total_stats)
+            sum_stats = {}
+            for req_stats in total_stats:
+                for key, value in req_stats.items():
+                    sum_stats[key] = sum_stats.get(key, 0) + sum(value)
+            print(
+                f"transferred_tokens={sum_stats['transferred_tokens']}|"
+                f"elapsed_ms={sum_stats['elapsed_ms']}|"
+                f"hit_ratio={sum_stats['gpu_tokens'] / (sum_stats['gpu_tokens'] + sum_stats['cpu_tokens'])}|"
+                f"gpu_tokens_per_call={sum_stats['gpu_tokens'] / sum_stats['gpu_calls']}|"
+                f"cpu_tokens_per_call={sum_stats['cpu_tokens'] / sum_stats['cpu_calls']}|"
+                f"promotion_utilization={sum_stats['gpu_tokens'] / sum_stats['promotions']}|"
+                f"gpu_compute_time={sum_stats['gpu_compute_time']}|"
+                f"cpu_compute_time={sum_stats['cpu_compute_time']}|"
+                f"cpu_tokens_move_time={sum_stats['cpu_tokens_move_time']}|"
+                f"experts_move_time={sum_stats['experts_move_time']}"
+            )
 
         stop = time.time()
         print(f'Time: {stop-start}, TPS: {total_token/(stop-start)}({np.mean(tpss)}), {total_token=}')

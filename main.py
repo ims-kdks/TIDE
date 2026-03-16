@@ -7,11 +7,12 @@ base_device = "cuda:0"
 model: LLaDA2MoeModelLM = LLaDA2MoeModelLM.from_pretrained(
     model_path, trust_remote_code=True, dtype=torch.bfloat16
 ).eval()
+# model = model.to(base_device)
 offload_info = model.enable_predictive_expert_offload(
     predictive_expert_offload=True,
     collect_stats=True,
     max_gpu_experts_per_layer=128,
-    jump_steps=8,
+    jump_steps=2,
 )
 print(offload_info)
 

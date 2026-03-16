@@ -36,14 +36,16 @@ ouput_dir='./out' # your custom output directory
 save_samples=True # save samples
 eos_early_stop=True
 predictive_expert_offload=True
-collect_stats=False
+collect_stats=True
 max_gpu_experts_per_layer=128
 jump_steps=10
-limit=10
+limit=100
 task=mbpp_sanitized_llada_moe
 # for llada 1.5 use tasks gsm8k_llada1.5 mbpp_sanitized_llada1.5
 # for llada moe use tasks gsm8k_llada_moe mbpp_sanitized_llada_moe
 output_path=${ouput_dir}/${task}
+
+echo ${model_path}
 
 python eval_dinfer.py --tasks ${task} \
 --confirm_run_unsafe_code --model dInfer_eval \

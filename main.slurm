@@ -1,13 +1,13 @@
 #!/bin/bash
-#SBATCH --mem=64g
+#SBATCH --mem=256g
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=4    # <- match to OMP_NUM_THREADS
-#SBATCH --partition=gpuA40x4      # <- or one of: gpuA100x4 gpuA40x4 gpuA100x8 gpuMI100x8
-#SBATCH --account=bffh-delta-gpu    # <- match to a "Project" returned by the "accounts" command
+#SBATCH --partition=gpuH200x8      # <- or one of: gpuA100x4 gpuA40x4 gpuA100x8 gpuMI100x8
+#SBATCH --account=bekz-delta-gpu    # <- match to a "Project" returned by the "accounts" command
 #SBATCH --job-name=main
 #SBATCH --output=out/%x-%j.out
-#SBATCH --time=02:00:00      # hh:mm:ss for the job
+#SBATCH --time=20:00:00      # hh:mm:ss for the job
 ### GPU options ###
 #SBATCH --gpus-per-node=1
 

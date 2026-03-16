@@ -351,13 +351,16 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         to_demote = can_demote[:len(to_promote)]
         target_set.update(can_demote[len(to_promote):])
 
+        start = time.perf_counter()
         for idx in to_demote:
             self.experts[idx].to("cpu")
         for idx in to_promote:
             self.experts[idx].to("cuda")
+        elapsed_ms = time.perf_counter() - start
 
         self._resident_gpu_experts = target_set
         if self.collect_stats:
+            self._offload_stats["experts_move_time"] += elapsed_ms
             self._offload_stats["promotions"] += len(to_promote)
             self._offload_stats["demotions"] += len(to_demote)
 
@@ -367,6 +370,11 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             "gpu_tokens": 0,
             "cpu_calls": 0,
             "gpu_calls": 0,
+            "cpu_compute_time": 0,
+            "gpu_compute_time": 0,
+            "cpu_tokens_move_time": 0,
+            "gpu_tokens_move_time": 0,
+            "experts_move_time": 0,
             "promotions": 0,
             "demotions": 0,
         }
@@ -418,19 +426,30 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             expert = self.experts[i]
             tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
             expert_device = self._get_expert_device(i)
+            tokens_move_time = 0
             if expert_device != tokens_for_this_expert.device:
+                start = time.perf_counter()
                 tokens_for_this_expert = tokens_for_this_expert.to(expert_device)
+                tokens_move_time = time.perf_counter() - start
+            start = time.perf_counter()
             expert_out = expert(tokens_for_this_expert)
+            compute_time = time.perf_counter() - start
             if expert_out.device != x.device:
+                start = time.perf_counter()
                 expert_out = expert_out.to(x.device)
+                tokens_move_time = time.perf_counter() - start + tokens_move_time
             outputs[start_idx:end_idx] = expert_out
             if self.collect_stats:
                 if expert_device.type == "cpu":
                     self._offload_stats["cpu_tokens"] += num_tokens
                     self._offload_stats["cpu_calls"] += 1
+                    self._offload_stats["cpu_compute_time"] += compute_time
+                    self._offload_stats["cpu_tokens_move_time"] += tokens_move_time
                 else:
                     self._offload_stats["gpu_tokens"] += num_tokens
                     self._offload_stats["gpu_calls"] += 1
+                    self._offload_stats["gpu_compute_time"] += compute_time
+                    self._offload_stats["gpu_tokens_move_time"] += tokens_move_time
             start_idx = end_idx
 
         new_x = torch.empty_like(outputs)
@@ -471,19 +490,30 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             expert = self.experts[i]
             tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
             expert_device = self._get_expert_device(i)
+            tokens_move_time = 0
             if expert_device != tokens_for_this_expert.device:
+                start = time.perf_counter()
                 tokens_for_this_expert = tokens_for_this_expert.to(expert_device)
+                tokens_move_time = time.perf_counter() - start
+            start = time.perf_counter()
             expert_out = expert(tokens_for_this_expert)
+            compute_time = time.perf_counter() - start
             if expert_out.device != x.device:
+                start = time.perf_counter()
                 expert_out = expert_out.to(x.device)
+                tokens_move_time = time.perf_counter() - start + tokens_move_time
             outputs[start_idx:end_idx] = expert_out
             if self.collect_stats:
                 if expert_device.type == "cpu":
                     self._offload_stats["cpu_tokens"] += num_tokens
                     self._offload_stats["cpu_calls"] += 1
+                    self._offload_stats["cpu_compute_time"] += compute_time
+                    self._offload_stats["cpu_tokens_move_time"] += tokens_move_time
                 else:
                     self._offload_stats["gpu_tokens"] += num_tokens
                     self._offload_stats["gpu_calls"] += 1
+                    self._offload_stats["gpu_compute_time"] += compute_time
+                    self._offload_stats["gpu_tokens_move_time"] += tokens_move_time
             start_idx = end_idx
 
         new_x = torch.empty_like(outputs)
@@ -1588,6 +1618,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
         num_transfer_tokens_schedule = self._get_num_transfer_tokens(
             block_length, denoising_steps_per_block
         )
+        stats = []
         for num_block in range(prefill_blocks, num_blocks):
             current_window_end = (num_block + 1) * block_length
             cur_x = x[:, :current_window_end]
@@ -1603,11 +1634,12 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
                     break
                 step_start_time = time.perf_counter()
 
+                move_experts = (num_block == prefill_blocks) or (self.predictive_offload_enabled and step % self.jump_steps == 0)
                 logits = self.forward(
                     cur_x,
                     attention_mask=cur_attn_mask,
                     position_ids=cur_position_ids,
-                    use_jit=(self.predictive_offload_enabled and step % self.jump_steps == 0),
+                    use_jit=move_experts,
                 ).logits
 
                 active_logits = logits[:, -block_length:, :]
@@ -1635,7 +1667,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
                     cur_x[:, -block_length:][transfer_index] = x0[transfer_index]
 
                 if self.collect_stats:
-                    print({
+                    stats.append({
                         "block": num_block,
                         "step": step,
                         "elapsed_ms": (time.perf_counter() - step_start_time) * 1000.0,
@@ -1651,8 +1683,8 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
                     if len(eos_pos_in_x[0]) > 0:
                         eos_pos = eos_pos_in_x[0][0].item()
                         if (cur_x[0, prompt_length:eos_pos] != mask_id).all():
-                            final_x = x[:, :total_length][:, : eos_pos + 1]
-                            return final_x
+                            final_x = x[:, :total_length][:, : eos_pos + 1][:, input_ids.shape[1]:]
+                            return final_x, stats
 
             x[:, :current_window_end] = cur_x
             if (
@@ -1672,4 +1704,4 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
             first_mask_position = gen_length
         return generated_answer[
             :, input_ids.shape[1] : input_ids.shape[1] + first_mask_position + 1
-        ]
+        ], stats
