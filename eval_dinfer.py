@@ -82,6 +82,8 @@ class DInferEvalHarness(LM):
         collect_stats = False,
         max_gpu_experts_per_layer = 128,
         jump_steps = 1,
+        temperature = 0.0,
+        do_sample = True,
         **kwargs
     ):
 
@@ -103,6 +105,8 @@ class DInferEvalHarness(LM):
         self.use_shift = use_shift
         self.save_samples = save_samples
         self.eos_early_stop = eos_early_stop
+        self.do_sample = do_sample
+        self.temperature = temperature
 
         self.mask_id = 156895
         self.eos_id = 156892
@@ -314,28 +318,31 @@ class DInferEvalHarness(LM):
         
         answers = []
         outputs = []
-        start = time.time()
         tpss = []
         total_token = 0
         token_numbers = []
         total_stats = []
+        total_time = 0
         for i, req in enumerate(tqdm(requests, desc="Generating...")):
             input_ids = all_input_ids[i]
             padded_gen_len = padded_gen_lens[i]
-            inner_start = time.time()
+            inner_start = time.perf_counter()
             input_ids = input_ids.to(self.device)
             out, stats = self.model.generate(
                 input_ids,
                 gen_length=padded_gen_len,
                 block_length=self.block_length,
-                eos_early_stop=self.eos_early_stop
+                eos_early_stop=self.eos_early_stop,
+                temperature=self.temperature,
+                do_sample=self.do_sample,
             )
-            inner_stop = time.time()
+            inner_stop = time.perf_counter()
             sample_time = inner_stop - inner_start
+            total_time += sample_time
             outputs.append(out)
             answer = (self.tokenizer.decode(out[0], skip_special_tokens=True))
             answers.append(answer)
-            token_number = (out != self.eos_id).sum().item()
+            token_number = out.numel()
             token_numbers.append(token_number)
             tps = token_number/sample_time
             tpss.append(tps)
@@ -356,10 +363,10 @@ class DInferEvalHarness(LM):
                 "experts_move_time": [step["offload_stats"]["experts_move_time"] for step in stats],
                 "transferred_tokens": [step["transferred_tokens"] for step in stats],
                 "elapsed_ms": [step["elapsed_ms"] for step in stats],
+                "step_count": [len(stats)],
             })
 
         if total_stats:
-            stats_count = len(total_stats)
             sum_stats = {}
             for req_stats in total_stats:
                 for key, value in req_stats.items():
@@ -371,14 +378,15 @@ class DInferEvalHarness(LM):
                 f"gpu_tokens_per_call={sum_stats['gpu_tokens'] / sum_stats['gpu_calls']}|"
                 f"cpu_tokens_per_call={sum_stats['cpu_tokens'] / sum_stats['cpu_calls']}|"
                 f"promotion_utilization={sum_stats['gpu_tokens'] / sum_stats['promotions']}|"
-                f"gpu_compute_time={sum_stats['gpu_compute_time']}|"
-                f"cpu_compute_time={sum_stats['cpu_compute_time']}|"
-                f"cpu_tokens_move_time={sum_stats['cpu_tokens_move_time']}|"
-                f"experts_move_time={sum_stats['experts_move_time']}"
+                f"gpu_compute_time={sum_stats['gpu_compute_time'] / sum_stats['step_count']}|"
+                f"cpu_compute_time={sum_stats['cpu_compute_time'] / sum_stats['step_count']}|"
+                f"cpu_tokens_move_time={sum_stats['cpu_tokens_move_time'] / sum_stats['step_count']}|"
+                f"experts_move_time={sum_stats['experts_move_time'] / sum_stats['step_count']}|"
+                f"promotions={sum_stats['promotions'] / sum_stats['step_count']}|"
+                f"cpu_tokens={sum_stats['cpu_tokens'] / sum_stats['step_count']}|"
             )
 
-        stop = time.time()
-        print(f'Time: {stop-start}, TPS: {total_token/(stop-start)}({np.mean(tpss)}), {total_token=}')
+        print(f'Time: {total_time}, TPS: {np.mean(tpss)}, {total_token=}, step_count: {sum_stats["step_count"]}, step/sec: {sum_stats["step_count"] / total_time}')
 
         if self.show_speed and self.save_dir is not None:
             with open (self.save_dir+f'/rank{self.rank}_results.jsonl', 'w', encoding='utf-8') as file:

@@ -356,11 +356,11 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             self.experts[idx].to("cpu")
         for idx in to_promote:
             self.experts[idx].to("cuda")
-        elapsed_ms = time.perf_counter() - start
+        elapsed_s = time.perf_counter() - start
 
         self._resident_gpu_experts = target_set
         if self.collect_stats:
-            self._offload_stats["experts_move_time"] += elapsed_ms
+            self._offload_stats["experts_move_time"] += elapsed_s
             self._offload_stats["promotions"] += len(to_promote)
             self._offload_stats["demotions"] += len(to_demote)
 
@@ -1488,7 +1488,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
         return logits.masked_fill(mask_indices, float("-inf"))
 
     def _sample_with_temperature_topk_topp(
-        self, logits, temperature=1.0, top_k=0, top_p=1.0
+        self, logits, temperature=1.0, top_k=0, top_p=1.0, do_sample=True
     ):
         orig_shape = logits.shape[:-1]
         vocab_size = logits.shape[-1]
@@ -1498,7 +1498,10 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
         logits = self._top_k_logits(logits, top_k)
         logits = self._top_p_logits(logits, top_p)
         probs = F.softmax(logits, dim=-1)
-        token = torch.multinomial(probs, num_samples=1)
+        if do_sample:
+            token = torch.multinomial(probs, num_samples=1)
+        else:
+            token = torch.argmax(probs, -1, keepdim=True)
         token_prob = torch.gather(probs, -1, token)
         return token.view(*orig_shape), token_prob.view(*orig_shape)
 
@@ -1644,7 +1647,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
 
                 active_logits = logits[:, -block_length:, :]
                 x0, x0_p = self._sample_with_temperature_topk_topp(
-                    active_logits, temperature=temperature, top_k=top_k, top_p=top_p
+                    active_logits, temperature=temperature, top_k=top_k, top_p=top_p, do_sample=do_sample
                 )
 
                 num_to_transfer = num_transfer_tokens_schedule[step].item()
