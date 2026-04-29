@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --mem=64g
+#SBATCH --mem=256g
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=4    # <- match to OMP_NUM_THREADS
-#SBATCH --partition=gpuA40x4      # <- or one of: gpuA100x4 gpuA40x4 gpuA100x8 gpuMI100x8 gpuH200x8
+#SBATCH --cpus-per-task=32    # <- match to OMP_NUM_THREADS
+#SBATCH --partition=gpuH200x8      # <- or one of: gpuA100x4 gpuA40x4 gpuA100x8 gpuMI100x8 gpuH200x8
 #SBATCH --account=bfgy-delta-gpu    # <- match to a "Project" returned by the "accounts" command
-#SBATCH --job-name=mini_192
+#SBATCH --job-name=flash_96
 #SBATCH --output=out/%x-%j.out
 #SBATCH --time=48:00:00      # hh:mm:ss for the job
 ### GPU options ###
@@ -28,24 +28,28 @@ export HF_DATASETS_TRUST_REMOTE_CODE=1
 export TRANSFORMERS_TRUST_REMOTE_CODE=1
 export CUDA_VISIBLE_DEVICES=0
 
-length=512
+# Pin OpenMP threads to physical cores to avoid migration overhead across the
+# many small parallel regions in CPU-offloaded MoE expert matmuls.
+export OMP_PROC_BIND=close
+
+length=256
 block_length=32
-model_path="inclusionAI/LLaDA2.0-mini"
-threshold=1
+model_path="inclusionAI/LLaDA2.0-flash"
+threshold=0.95
 output_dir="./out"
 save_samples=True
-eos_early_stop=False
+eos_early_stop=True
 predictive_expert_offload=True
 collect_stats=True
 limit=50
 task=mbpp_sanitized_llada_moe
-do_sample=False
+do_sample=True
 
 # Edit these two arrays to sweep the combinations you want.
-# jump_steps_list=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)
-# jump_steps_list=(16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31)
-jump_steps_list=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31)
-max_gpu_experts_per_layer_list=(192)
+# jump_steps_list=(1 2 3 4 5 6 7 8 9 10)
+# jump_steps_list=(10 11 12 13 14 15 16 17 18 19 20)
+jump_steps_list=(20 21 22 23 24 25 26 27 28 29 30 31)
+max_gpu_experts_per_layer_list=(96)
 
 # for llada 1.5 use tasks gsm8k_llada1.5 mbpp_sanitized_llada1.5
 # for llada moe use tasks gsm8k_llada_moe mbpp_sanitized_llada_moe
