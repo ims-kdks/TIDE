@@ -1,3 +1,7 @@
+'''
+Code adopted from https://github.com/inclusionAI/dInfer
+'''
+
 import evaluate as hf_evaluate
 import re
 from datasets import Dataset

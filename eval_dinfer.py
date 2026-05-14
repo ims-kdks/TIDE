@@ -1,5 +1,5 @@
 '''
-Code adapted from https://github.com/inclusionAI/dInfer
+Code adopted from https://github.com/inclusionAI/dInfer
 This file is inspired by the code from https://github.com/NVlabs/Fast-dLLM
 '''
 import torch
@@ -78,7 +78,6 @@ class DInferEvalHarness(LM):
         use_shift = False,
         save_samples = False,
         eos_early_stop = False,
-        predictive_expert_offload = True,
         collect_stats = False,
         max_gpu_experts_per_layer = 128,
         jump_steps = 1,
@@ -119,9 +118,8 @@ class DInferEvalHarness(LM):
         self.model = LLaDA2MoeModelLM.from_pretrained(model_path, dtype="bfloat16", config=config).eval()
         # self.model = self.model.to(self.device)
         offload_info = self.model.enable_predictive_expert_offload(
-            predictive_expert_offload=predictive_expert_offload,
-            collect_stats=collect_stats,
             max_gpu_experts_per_layer=max_gpu_experts_per_layer,
+            collect_stats=collect_stats,
             jump_steps=jump_steps,
         )
         print(offload_info)

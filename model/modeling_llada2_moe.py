@@ -1,3 +1,5 @@
+# Code adopted from https://huggingface.co/inclusionAI/LLaDA2.0-mini
+#
 # Copyright 2025 Antgroup and The HuggingFace Inc. team. All rights reserved.
 #
 # This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
@@ -17,7 +19,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """PyTorch LLaDA2MoE model."""
-from attr import s
 
 import math
 import time
@@ -200,7 +201,7 @@ class LLaDA2MoeMLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x, use_jit: Optional[bool] = False):
+    def forward(self, x, refresh_experts: Optional[bool] = False):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -293,9 +294,8 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
                 intermediate_size=config.moe_intermediate_size
                 * config.num_shared_experts,
             )
-        self._offload_enabled = False
-        self._gpu_expert_budget = self.config.num_experts
-        self._resident_gpu_experts: set[int] = set()
+        self.gpu_expert_budget = self.config.num_experts
+        self.resident_gpu_experts: set[int] = set()
         self.collect_stats = False
         self.reset_stats()
 
@@ -310,14 +310,14 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             ]
         )
 
-    def _get_expert_device(self, idx: int) -> torch.device:
+    def get_expert_device(self, idx: int) -> torch.device:
         return next(self.experts[idx].parameters()).device
 
-    def _refresh_resident_gpu_experts(self) -> None:
-        self._resident_gpu_experts = {
+    def refresh_resident_gpu_experts(self) -> None:
+        self.resident_gpu_experts = {
             idx
             for idx in range(self.config.num_experts)
-            if self._get_expert_device(idx).type == "cuda"
+            if self.get_expert_device(idx).type == "cuda"
         }
 
     @torch.no_grad()
@@ -326,26 +326,25 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         gpu_expert_budget: int,
         collect_stats: bool = False,
     ) -> None:
-        self._offload_enabled = True
-        self._gpu_expert_budget = min(gpu_expert_budget, self.config.num_experts)
+        self.gpu_expert_budget = min(gpu_expert_budget, self.config.num_experts)
         self.collect_stats = collect_stats
         self.reset_stats()
         for idx, expert in enumerate(self.experts):
-            if idx < self._gpu_expert_budget:
+            if idx < self.gpu_expert_budget:
                 expert.to("cuda")
             else:
                 expert.to("cpu")
-        self._refresh_resident_gpu_experts()
+        self.refresh_resident_gpu_experts()
 
     @torch.no_grad()
-    def set_predicted_gpu_experts(self, target_order: list[int]) -> None:
+    def update_expert_placement(self, target_order: list[int]) -> None:
         # # Verify current number of experts on GPU
-        # experts_device_count = [idx for idx in range(self.config.num_experts) if self._get_expert_device(idx).type == "cuda"]
+        # experts_device_count = [idx for idx in range(self.config.num_experts) if self.get_expert_device(idx).type == "cuda"]
         # print(f"Current GPU experts: {len(experts_device_count)}")
         
         target_set = set(target_order)
-        to_promote = [idx for idx in target_order if idx not in self._resident_gpu_experts]
-        can_demote = [idx for idx in self._resident_gpu_experts if idx not in target_set]
+        to_promote = [idx for idx in target_order if idx not in self.resident_gpu_experts]
+        can_demote = [idx for idx in self.resident_gpu_experts if idx not in target_set]
         
         # Cap the number of demotions to the number of promotions to avoid unnecessary data transfer when the target set is very different from the current set
         to_demote = can_demote[:len(to_promote)]
@@ -358,14 +357,14 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             self.experts[idx].to("cuda")
         elapsed_s = time.perf_counter() - start
 
-        self._resident_gpu_experts = target_set
+        self.resident_gpu_experts = target_set
         if self.collect_stats:
-            self._offload_stats["experts_move_time"] += elapsed_s
-            self._offload_stats["promotions"] += len(to_promote)
-            self._offload_stats["demotions"] += len(to_demote)
+            self.offload_stats["experts_move_time"] += elapsed_s
+            self.offload_stats["promotions"] += len(to_promote)
+            self.offload_stats["demotions"] += len(to_demote)
 
     def reset_stats(self) -> None:
-        self._offload_stats = {
+        self.offload_stats = {
             "cpu_tokens": 0,
             "gpu_tokens": 0,
             "cpu_calls": 0,
@@ -379,7 +378,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             "demotions": 0,
         }
 
-    def forward(self, hidden_states, use_jit: Optional[bool] = False):
+    def forward(self, hidden_states, refresh_experts: Optional[bool] = False):
         identity = hidden_states
         bsz, seq_len, h = hidden_states.shape
         topk_idx, topk_weight, router_logits = self.gate(hidden_states)
@@ -395,8 +394,8 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
             y = y.to(hidden_states.dtype).view(bsz, seq_len, h)
         else:
-            if use_jit:
-                y = self.jit_moe_infer(hidden_states, topk_idx, topk_weight).view(
+            if refresh_experts:
+                y = self.moe_infer_with_expert_refresh(hidden_states, topk_idx, topk_weight).view(
                     bsz, seq_len, h
                 )
             else:
@@ -425,7 +424,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             end_idx = start_idx + num_tokens
             expert = self.experts[i]
             tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
-            expert_device = self._get_expert_device(i)
+            expert_device = self.get_expert_device(i)
             tokens_move_time = 0
             if expert_device != tokens_for_this_expert.device:
                 start = time.perf_counter()
@@ -441,15 +440,15 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             outputs[start_idx:end_idx] = expert_out
             if self.collect_stats:
                 if expert_device.type == "cpu":
-                    self._offload_stats["cpu_tokens"] += num_tokens
-                    self._offload_stats["cpu_calls"] += 1
-                    self._offload_stats["cpu_compute_time"] += compute_time
-                    self._offload_stats["cpu_tokens_move_time"] += tokens_move_time
+                    self.offload_stats["cpu_tokens"] += num_tokens
+                    self.offload_stats["cpu_calls"] += 1
+                    self.offload_stats["cpu_compute_time"] += compute_time
+                    self.offload_stats["cpu_tokens_move_time"] += tokens_move_time
                 else:
-                    self._offload_stats["gpu_tokens"] += num_tokens
-                    self._offload_stats["gpu_calls"] += 1
-                    self._offload_stats["gpu_compute_time"] += compute_time
-                    self._offload_stats["gpu_tokens_move_time"] += tokens_move_time
+                    self.offload_stats["gpu_tokens"] += num_tokens
+                    self.offload_stats["gpu_calls"] += 1
+                    self.offload_stats["gpu_compute_time"] += compute_time
+                    self.offload_stats["gpu_tokens_move_time"] += tokens_move_time
             start_idx = end_idx
 
         new_x = torch.empty_like(outputs)
@@ -464,9 +463,9 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         return final_out
 
     @torch.no_grad()
-    def jit_moe_infer(self, x, topk_ids, topk_weight):
+    def moe_infer_with_expert_refresh(self, x, topk_ids, topk_weight):
         """
-        This path is used only when predictive_offload_enabled is set to False.
+        This path is used only when refresh_experts is set to True.
         Based on the input, decide what experts should be moved to (or stay on) the GPU, and what experts should be moved to (or stay on) CPU.
         Be respectful to the gpu_expert_budget.
         """
@@ -474,9 +473,9 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         flat_topk_ids = topk_ids.view(-1)
         expert_token_counts = torch.bincount(flat_topk_ids, minlength=num_experts)
 
-        top_counts, top_indices = torch.topk(expert_token_counts, k=self._gpu_expert_budget)
+        top_counts, top_indices = torch.topk(expert_token_counts, k=self.gpu_expert_budget)
         target_gpu_experts = top_indices[top_counts > 0].tolist()
-        self.set_predicted_gpu_experts(target_gpu_experts)
+        self.update_expert_placement(target_gpu_experts)
 
         tokens_per_expert = expert_token_counts.tolist()
         idxs = flat_topk_ids.argsort()
@@ -489,7 +488,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             end_idx = start_idx + num_tokens
             expert = self.experts[i]
             tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
-            expert_device = self._get_expert_device(i)
+            expert_device = self.get_expert_device(i)
             tokens_move_time = 0
             if expert_device != tokens_for_this_expert.device:
                 start = time.perf_counter()
@@ -505,15 +504,15 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             outputs[start_idx:end_idx] = expert_out
             if self.collect_stats:
                 if expert_device.type == "cpu":
-                    self._offload_stats["cpu_tokens"] += num_tokens
-                    self._offload_stats["cpu_calls"] += 1
-                    self._offload_stats["cpu_compute_time"] += compute_time
-                    self._offload_stats["cpu_tokens_move_time"] += tokens_move_time
+                    self.offload_stats["cpu_tokens"] += num_tokens
+                    self.offload_stats["cpu_calls"] += 1
+                    self.offload_stats["cpu_compute_time"] += compute_time
+                    self.offload_stats["cpu_tokens_move_time"] += tokens_move_time
                 else:
-                    self._offload_stats["gpu_tokens"] += num_tokens
-                    self._offload_stats["gpu_calls"] += 1
-                    self._offload_stats["gpu_compute_time"] += compute_time
-                    self._offload_stats["gpu_tokens_move_time"] += tokens_move_time
+                    self.offload_stats["gpu_tokens"] += num_tokens
+                    self.offload_stats["gpu_calls"] += 1
+                    self.offload_stats["gpu_compute_time"] += compute_time
+                    self.offload_stats["gpu_tokens_move_time"] += tokens_move_time
             start_idx = end_idx
 
         new_x = torch.empty_like(outputs)
@@ -737,7 +736,7 @@ class LLaDA2MoeDecoderLayer(nn.Module):
         position_embeddings: Optional[
             tuple[torch.Tensor, torch.Tensor]
         ] = None,  # necessary, but kept here for BC
-        use_jit: Optional[bool] = False,
+        refresh_experts: Optional[bool] = False,
         **kwargs,
     ) -> tuple[
         torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]
@@ -782,7 +781,7 @@ class LLaDA2MoeDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states, use_jit)
+        hidden_states = self.mlp(hidden_states, refresh_experts)
         if isinstance(hidden_states, tuple):
             hidden_states, router_logits = hidden_states
         else:
@@ -970,7 +969,7 @@ class LLaDA2MoeModel(LLaDA2MoePreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        use_jit: Optional[bool] = False,
+        refresh_experts: Optional[bool] = False,
         **kwargs,
     ) -> tuple | MoeModelOutputWithPast:
         output_attentions = (
@@ -1080,7 +1079,7 @@ class LLaDA2MoeModel(LLaDA2MoePreTrainedModel):
                     output_router_logits=output_router_logits,
                     use_cache=use_cache,
                     position_embeddings=position_embeddings,
-                    use_jit=use_jit,
+                    refresh_experts=refresh_experts,
                 )
             hidden_states = layer_outputs[0]
 
@@ -1188,9 +1187,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
     def enable_predictive_expert_offload(
         self,
         max_gpu_experts_per_layer: int,
-        min_gpu_experts_per_layer: int = 0,
         reserve_vram_gb: float = 1.5,
-        predictive_expert_offload: bool = True,
         collect_stats: bool = False,
         jump_steps: int = 1,
     ) -> dict[str, Any]:
@@ -1210,13 +1207,10 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
         expert_param_bytes = self._estimate_expert_parameter_bytes()
 
         max_budget = min(max_gpu_experts_per_layer, self.config.num_experts)
-        min_budget = min(min_gpu_experts_per_layer, self.config.num_experts)
-        assert 0 <= min_budget <= max_budget
+        assert 0 <= max_budget
 
-        computed_budget = usable_bytes // max(
-            1, expert_param_bytes * max(1, len(self.moe_layers))
-        )
-        gpu_expert_budget = max(min_budget, min(max_budget, computed_budget))
+        computed_budget = usable_bytes // (expert_param_bytes * len(self.moe_layers))
+        gpu_expert_budget = min(max_budget, computed_budget)
 
         for _, moe_block in self.moe_layers:
             moe_block.enable_offload(
@@ -1225,7 +1219,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
             )
 
         self.collect_stats = collect_stats
-        self.predictive_offload_enabled = predictive_expert_offload
+        self.predictive_offload_enabled = True
         self.jump_steps = jump_steps
         return {
             "enabled": self.predictive_offload_enabled,
@@ -1241,29 +1235,9 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
     def get_offload_stats(self) -> dict[str, int]:
         total_stats: dict[str, int] = {}
         for layer_idx, moe_block in self.moe_layers:
-            for key, value in moe_block._offload_stats.items():
+            for key, value in moe_block.offload_stats.items():
                 total_stats[key] = total_stats.get(key, 0) + value    
         return total_stats
-
-    def predict_experts_from_router(
-        self,
-        router_outputs,
-        active_block_mask: torch.Tensor,
-        block_length: int,
-    ) -> dict[int, list[int]]:
-        predicted: dict[int, list[int]] = {}
-        for (layer_idx, moe_block), (_, topk_idx) in zip(self.moe_layers, router_outputs):
-            budget = moe_block._gpu_expert_budget
-            selected: list[int] = []
-
-            layer_topk = topk_idx[:, -block_length:, :]
-            counts = torch.bincount(layer_topk.reshape(-1), minlength=self.config.num_experts)
-            for expert_id in torch.topk(counts, k=budget).indices.tolist():
-                if counts[expert_id].item() <= 0:
-                    continue
-                selected.append(expert_id)
-            predicted[layer_idx] = selected
-        return predicted
 
     @add_start_docstrings_to_model_forward(LLADA2MOE_INPUTS_DOCSTRING)
     @replace_return_docstrings(
@@ -1282,7 +1256,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        use_jit: Optional[bool] = False,
+        refresh_experts: Optional[bool] = False,
         **kwargs,
     ) -> tuple | MoeCausalLMOutputWithPast:
         r"""
@@ -1340,7 +1314,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
             return_dict=return_dict,
-            use_jit=use_jit,
+            refresh_experts=refresh_experts,
             **kwargs,
         )
 
@@ -1519,7 +1493,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
     def generate(
         self,
         input_ids: Optional[torch.Tensor] = None,
-        temperature: int = 0.0,
+        temperature: float = 0.0,
         block_length: int = 32,
         steps: int = 32,
         gen_length: int = 2048,
@@ -1637,12 +1611,12 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
                     break
                 step_start_time = time.perf_counter()
 
-                move_experts = (num_block == prefill_blocks) or (self.predictive_offload_enabled and step % self.jump_steps == 0)
+                refresh_experts = (num_block == prefill_blocks) or (self.predictive_offload_enabled and step % self.jump_steps == 0)
                 logits = self.forward(
                     cur_x,
                     attention_mask=cur_attn_mask,
                     position_ids=cur_position_ids,
-                    use_jit=move_experts,
+                    refresh_experts=refresh_experts,
                 ).logits
 
                 active_logits = logits[:, -block_length:, :]

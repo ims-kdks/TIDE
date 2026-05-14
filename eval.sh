@@ -11,7 +11,6 @@ model_path="inclusionAI/LLaDA2.0-mini"
 output_dir="./out"
 save_samples=True
 eos_early_stop=False
-predictive_expert_offload=True
 collect_stats=True
 task=mbpp_sanitized_llada_moe
 do_sample=True
@@ -33,6 +32,6 @@ for jump_steps in "${jump_steps_list[@]}"; do
 
     python eval_dinfer.py --tasks "${task}" \
         --confirm_run_unsafe_code --model dInfer_eval \
-        --model_args model_path=${model_path},gen_length=${length},block_length=${block_length},threshold=${threshold},show_speed=True,save_dir=${output_path},save_samples=${save_samples},eos_early_stop=${eos_early_stop},predictive_expert_offload=${predictive_expert_offload},collect_stats=${collect_stats},max_gpu_experts_per_layer=${max_gpu_experts_per_layer},jump_steps=${jump_steps},do_sample=${do_sample} \
+        --model_args model_path=${model_path},gen_length=${length},block_length=${block_length},threshold=${threshold},show_speed=True,save_dir=${output_path},save_samples=${save_samples},eos_early_stop=${eos_early_stop},collect_stats=${collect_stats},max_gpu_experts_per_layer=${max_gpu_experts_per_layer},jump_steps=${jump_steps},do_sample=${do_sample} \
         --output_path "${output_path}" --include_path ./tasks --apply_chat_template
 done

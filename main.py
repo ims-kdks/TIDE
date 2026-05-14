@@ -9,9 +9,8 @@ model: LLaDA2MoeModelLM = LLaDA2MoeModelLM.from_pretrained(
 ).eval()
 # model = model.to(base_device)
 offload_info = model.enable_predictive_expert_offload(
-    predictive_expert_offload=True,
-    collect_stats=True,
     max_gpu_experts_per_layer=128,
+    collect_stats=True,
     jump_steps=2,
 )
 print(offload_info)
