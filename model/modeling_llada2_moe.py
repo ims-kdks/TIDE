@@ -1,4 +1,4 @@
-# Code adopted from https://huggingface.co/inclusionAI/LLaDA2.0-mini
+# Code adapted from https://huggingface.co/inclusionAI/LLaDA2.0-mini
 #
 # Copyright 2025 Antgroup and The HuggingFace Inc. team. All rights reserved.
 #

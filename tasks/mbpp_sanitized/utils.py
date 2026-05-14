@@ -1,5 +1,5 @@
 '''
-Code adopted from https://github.com/inclusionAI/dInfer
+Code adapted from https://github.com/inclusionAI/dInfer
 '''
 
 import evaluate as hf_evaluate
