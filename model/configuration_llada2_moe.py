@@ -1,4 +1,8 @@
-"""LLaDA2 MoE model configuration"""
+"""
+Code adapted from https://huggingface.co/inclusionAI/LLaDA2.0-mini
+
+LLaDA2 MoE model configuration
+"""
 
 from transformers.configuration_utils import PretrainedConfig
 
