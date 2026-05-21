@@ -2,6 +2,8 @@
 
 [![arXiv](https://img.shields.io/badge/Paper-arXiv-red?logo=arxiv)](https://arxiv.org/abs/2605.20179) [![arXiv](https://img.shields.io/badge/Project%20Page-red)](https://tide-paper.vercel.app/)
 
+<img width="1847" height="839" alt="figure1-2" src="https://github.com/user-attachments/assets/502f54f0-738d-40e8-8de4-996522f3bfe5" />
+
 ## Setup
 
 ```bash
