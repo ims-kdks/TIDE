@@ -1,5 +1,7 @@
 # TIDE: Efficient and Lossless MoE Diffusion LLM Inference with I/O-aware Expert Offload
 
+[![arXiv](https://img.shields.io/badge/Paper-arXiv-red?logo=arxiv)](https://arxiv.org/abs/2605.20179) [![arXiv](https://img.shields.io/badge/Project%20Page-red)](https://tide-paper.vercel.app/)
+
 ## Setup
 
 ```bash
